@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]==0.52.4
+python-dotenv
+PyJWT
+cryptography
+httpx
+google-genai
+asyncpg
