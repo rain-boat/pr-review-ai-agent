@@ -1,7 +1,14 @@
 import json
 import re
 
+from google.genai import types
+
 from app.gimini import client
+from app.repo_workspace import RepoWorkspace
+
+
+REVIEW_MODEL = "gemini-3.8-flash"
+MAX_TOOL_ROUNDS = 12
 
 
 def add_line_numbers_to_patch(patch: str) -> str:
@@ -47,7 +54,7 @@ def add_line_numbers_to_patch(patch: str) -> str:
     return "\n".join(result)
 
 
-def build_review_prompt(files: list[dict]) -> str:
+def build_changed_files_section(files: list[dict]) -> str:
     sections = []
 
     for file in files:
@@ -74,15 +81,140 @@ Changed lines:
 """
         )
 
-    diff = "\n".join(sections)
+    return "\n".join(sections)
 
-    prompt = f"""
+
+def review_tools() -> list[types.Tool]:
+    return [
+        types.Tool(
+            function_declarations=[
+                types.FunctionDeclaration(
+                    name="fetch_repo",
+                    description=(
+                        "Clone or update the pull request "
+                        "repository at the head commit. "
+                        "Call this before search_code or "
+                        "read_file."
+                    ),
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={},
+                    ),
+                ),
+                types.FunctionDeclaration(
+                    name="search_code",
+                    description=(
+                        "Search the cloned repository for "
+                        "callers or usages of a method, "
+                        "class, or symbol. Use this to find "
+                        "unchanged files that may break."
+                    ),
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "query": types.Schema(
+                                type=types.Type.STRING,
+                                description=(
+                                    "Text or regex to search, "
+                                    "for example a method name."
+                                ),
+                            ),
+                            "path": types.Schema(
+                                type=types.Type.STRING,
+                                description=(
+                                    "Optional subdirectory or "
+                                    "file to limit the search."
+                                ),
+                            ),
+                        },
+                        required=["query"],
+                    ),
+                ),
+                types.FunctionDeclaration(
+                    name="read_file",
+                    description=(
+                        "Read a file from the cloned "
+                        "repository. Path is relative to "
+                        "the repo root."
+                    ),
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "path": types.Schema(
+                                type=types.Type.STRING,
+                                description=(
+                                    "File path relative to "
+                                    "the repository root."
+                                ),
+                            ),
+                            "start_line": types.Schema(
+                                type=types.Type.INTEGER,
+                                description="First line to read.",
+                            ),
+                            "end_line": types.Schema(
+                                type=types.Type.INTEGER,
+                                description="Last line to read.",
+                            ),
+                        },
+                        required=["path"],
+                    ),
+                ),
+            ]
+        )
+    ]
+
+
+def execute_tool(
+    workspace: RepoWorkspace,
+    name: str,
+    args: dict,
+) -> str:
+    if name == "fetch_repo":
+        return workspace.fetch_repo()
+
+    if name == "search_code":
+        return workspace.search_code(
+            query=args.get("query", ""),
+            path=args.get("path", "") or "",
+        )
+
+    if name == "read_file":
+        start_line = args.get("start_line", 1) or 1
+        end_line = args.get("end_line")
+
+        return workspace.read_file(
+            path=args.get("path", ""),
+            start_line=int(start_line),
+            end_line=(
+                int(end_line)
+                if end_line is not None
+                else None
+            ),
+        )
+
+    return f"Unknown tool: {name}"
+
+
+def build_review_prompt(files: list[dict]) -> str:
+    diff = build_changed_files_section(files)
+
+    return f"""
 You are an expert software engineer performing a GitHub Pull Request code review.
 
-Review the following GitHub Pull Request changes.
+You cannot run shell commands. You may only use these tools:
+- fetch_repo
+- search_code
+- read_file
+
+Workflow:
+1. Call fetch_repo so the PR head commit is available locally.
+2. From the changed methods/classes, call search_code to find callers in other files.
+3. Call read_file on relevant callers if you need more context.
+4. Then return the final JSON review.
 
 Focus only on meaningful issues involving:
 - Bugs and incorrect behavior
+- Breakage in callers of changed methods
 - Security vulnerabilities
 - Performance problems
 - Error handling
@@ -90,21 +222,20 @@ Focus only on meaningful issues involving:
 - Clear code quality problems
 
 Do not report formatting or style issues unless they cause a real problem.
-
-Only report issues supported by the provided code changes.
-Do not invent missing context.
+Do not invent missing context. If you need caller context, use the tools.
 
 IMPORTANT RULES FOR LINE NUMBERS:
 
 1. Every issue MUST have a "line" field.
 2. "line" must be an integer.
-3. "file" must exactly match one of the provided file paths.
+3. "file" must exactly match one of the provided CHANGED file paths.
 4. "line" must be a NEW_LINE number shown in the provided patch.
 5. Never use an OLD_LINE.
 6. Never invent a line number.
-7. If an issue cannot be attached to a changed NEW_LINE, do not report that issue.
+7. If a caller may break, attach the issue to the changed method's NEW_LINE and name the caller in the explanation.
+8. If an issue cannot be attached to a changed NEW_LINE, do not report that issue.
 
-Return ONLY valid JSON.
+When you are done using tools, return ONLY valid JSON.
 
 Do not use Markdown.
 Do not add ```json.
@@ -144,21 +275,24 @@ Pull Request changes:
 {diff}
 """
 
-    return prompt
 
+def parse_review_json(review_text: str) -> dict:
+    cleaned = review_text.strip()
 
-async def review_files(files: list[dict]) -> dict:
-    prompt = build_review_prompt(files)
-
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=prompt,
-    )
-
-    review_text = response.text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(
+            r"\s*```$",
+            "",
+            cleaned,
+        )
 
     try:
-        review = json.loads(review_text)
+        review = json.loads(cleaned)
     except json.JSONDecodeError as exc:
         raise ValueError(
             f"Gemini returned invalid JSON: {review_text}"
@@ -175,3 +309,122 @@ async def review_files(files: list[dict]) -> dict:
         )
 
     return review
+
+
+def collect_function_calls(response) -> list:
+    calls = getattr(response, "function_calls", None)
+
+    if calls:
+        return list(calls)
+
+    candidates = getattr(response, "candidates", None) or []
+
+    if not candidates:
+        return []
+
+    content = candidates[0].content
+    parts = getattr(content, "parts", None) or []
+    found = []
+
+    for part in parts:
+        function_call = getattr(part, "function_call", None)
+
+        if function_call and getattr(function_call, "name", None):
+            found.append(function_call)
+
+    return found
+
+
+async def review_files(
+    files: list[dict],
+    owner: str,
+    repo: str,
+    commit_id: str,
+    clone_url: str,
+    access_token: str,
+    pull_number: int,
+) -> dict:
+    workspace = RepoWorkspace(
+        owner=owner,
+        repo=repo,
+        commit_id=commit_id,
+        clone_url=clone_url,
+        access_token=access_token,
+        pull_number=pull_number,
+    )
+
+    prompt = build_review_prompt(files)
+    contents = [prompt]
+    tools = review_tools()
+    config = types.GenerateContentConfig(
+        tools=tools,
+    )
+
+    review_text = ""
+
+    for round_number in range(MAX_TOOL_ROUNDS):
+        response = client.models.generate_content(
+            model=REVIEW_MODEL,
+            contents=contents,
+            config=config,
+        )
+
+        function_calls = collect_function_calls(response)
+
+        if not function_calls:
+            review_text = (response.text or "").strip()
+            break
+
+        contents.append(response.candidates[0].content)
+
+        function_response_parts = []
+
+        for call in function_calls:
+            args = dict(call.args or {})
+
+            print(
+                f"Gemini tool call [{round_number + 1}]: "
+                f"{call.name} {args}"
+            )
+
+            try:
+                result = execute_tool(
+                    workspace=workspace,
+                    name=call.name,
+                    args=args,
+                )
+            except Exception as exc:
+                result = f"Tool error: {exc}"
+
+            print(
+                f"Tool result [{call.name}]: "
+                f"{result[:500]}"
+            )
+
+            function_response_parts.append(
+                types.Part.from_function_response(
+                    name=call.name,
+                    response={
+                        "result": result,
+                    },
+                )
+            )
+
+        contents.append(
+            types.Content(
+                role="user",
+                parts=function_response_parts,
+            )
+        )
+    else:
+        raise ValueError(
+            "Gemini used too many tool calls "
+            "without returning a review."
+        )
+
+    if not review_text:
+        raise ValueError(
+            "Gemini returned an empty review."
+        )
+
+    return parse_review_json(review_text)

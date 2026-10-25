@@ -428,6 +428,7 @@ from app.github import (
     complete_ai_review_check,
     create_ai_review_check,
     create_pull_request_review,
+    get_installation_access_token,
     get_pull_request_files,
 )
 from app.reviewer import review_files
@@ -468,6 +469,7 @@ async def review_pull_request(
     repo: str,
     pull_number: int,
     commit_id: str,
+    clone_url: str,
 ):
     print("=" * 60)
     print(
@@ -517,7 +519,21 @@ async def review_pull_request(
         # 3. Run Gemini review
         # --------------------------------------------------
 
-        review = await review_files(files)
+        access_token = (
+            await get_installation_access_token(
+                installation_id
+            )
+        )
+
+        review = await review_files(
+            files,
+            owner=owner,
+            repo=repo,
+            commit_id=commit_id,
+            clone_url=clone_url,
+            access_token=access_token,
+            pull_number=pull_number,
+        )
 
         issues = review.get(
             "issues",
@@ -878,6 +894,23 @@ async def github_webhook(
         "name"
     )
 
+    head_repo = (
+        pull_request
+        .get("head", {})
+        .get("repo")
+        or {}
+    )
+
+    clone_url = (
+        head_repo.get("clone_url")
+        or repository.get("clone_url")
+    )
+
+    if not clone_url and owner and repo:
+        clone_url = (
+            f"https://github.com/{owner}/{repo}.git"
+        )
+
     print(
         f"Repository: "
         f"{owner}/{repo}"
@@ -943,6 +976,15 @@ async def github_webhook(
             ),
         }
 
+    if not clone_url:
+        return {
+            "status": "error",
+            "message": (
+                "Missing repository "
+                "clone URL"
+            ),
+        }
+
     # --------------------------------------------------
     # 5. Start AI review
     # --------------------------------------------------
@@ -954,6 +996,7 @@ async def github_webhook(
             repo=repo,
             pull_number=pull_number,
             commit_id=commit_id,
+            clone_url=clone_url,
         )
 
         return {
