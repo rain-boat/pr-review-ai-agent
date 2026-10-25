@@ -8,7 +8,27 @@ from app.repo_workspace import RepoWorkspace
 
 
 REVIEW_MODEL = "gemini-3.8-flash"
-MAX_TOOL_ROUNDS = 12
+DEFAULT_TOOL_ROUNDS = 12
+MAX_TOOL_ROUNDS = 32
+
+
+def calculate_tool_round_limit(files: list[dict]) -> tuple[int, int]:
+    """Return the round budget and total changed lines for a PR diff."""
+    changed_lines = 0
+
+    for file in files:
+        patch = file.get("patch") or ""
+        for line in patch.splitlines():
+            if line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
+                changed_lines += 1
+
+    if changed_lines <= 100:
+        return DEFAULT_TOOL_ROUNDS, changed_lines
+    if changed_lines <= 500:
+        return 20, changed_lines
+    if changed_lines <= 1000:
+        return 28, changed_lines
+    return MAX_TOOL_ROUNDS, changed_lines
 
 
 def add_line_numbers_to_patch(patch: str) -> str:
@@ -159,6 +179,45 @@ def review_tools() -> list[types.Tool]:
                         required=["path"],
                     ),
                 ),
+                types.FunctionDeclaration(
+                    name="inspect_repo",
+                    description=(
+                        "Run several independent repository searches "
+                        "and read several relevant files in one tool call. "
+                        "Use this after fetch_repo to save tool rounds. "
+                        "Limit each request to the most relevant symbols/files."
+                    ),
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "searches": types.Schema(
+                                type=types.Type.ARRAY,
+                                description="Up to 12 independent code searches.",
+                                items=types.Schema(
+                                    type=types.Type.OBJECT,
+                                    properties={
+                                        "query": types.Schema(type=types.Type.STRING),
+                                        "path": types.Schema(type=types.Type.STRING),
+                                    },
+                                    required=["query"],
+                                ),
+                            ),
+                            "files": types.Schema(
+                                type=types.Type.ARRAY,
+                                description="Up to 12 relevant files to read.",
+                                items=types.Schema(
+                                    type=types.Type.OBJECT,
+                                    properties={
+                                        "path": types.Schema(type=types.Type.STRING),
+                                        "start_line": types.Schema(type=types.Type.INTEGER),
+                                        "end_line": types.Schema(type=types.Type.INTEGER),
+                                    },
+                                    required=["path"],
+                                ),
+                            ),
+                        },
+                    ),
+                ),
             ]
         )
     ]
@@ -192,11 +251,55 @@ def execute_tool(
             ),
         )
 
+    if name == "inspect_repo":
+        searches = args.get("searches", [])
+        files = args.get("files", [])
+        results = []
+
+        if not isinstance(searches, list) or not isinstance(files, list):
+            return "inspect_repo expects 'searches' and 'files' arrays."
+
+        for search in searches[:12]:
+            if not isinstance(search, dict):
+                continue
+            query = str(search.get("query", ""))
+            path = str(search.get("path", "") or "")
+            results.append(
+                f"### Search: {query} (path: {path or '.'})\n"
+                f"{workspace.search_code(query=query, path=path)}"
+            )
+
+        for file in files[:12]:
+            if not isinstance(file, dict):
+                continue
+            path = str(file.get("path", ""))
+            start_line = int(file.get("start_line", 1) or 1)
+            end_line = file.get("end_line")
+            file_result = workspace.read_file(
+                path=path,
+                start_line=start_line,
+                end_line=int(end_line) if end_line is not None else None,
+            )
+            results.append(
+                f"### File: {path}\n"
+                f"{file_result}"
+            )
+
+        if not results:
+            return "Provide at least one search or file to inspect."
+
+        output = "\n\n".join(results)
+        max_output_chars = 30000
+        if len(output) > max_output_chars:
+            output = output[:max_output_chars] + "\n...batch output truncated..."
+        return output
+
     return f"Unknown tool: {name}"
 
 
 def build_review_prompt(files: list[dict]) -> str:
     diff = build_changed_files_section(files)
+    tool_round_limit, changed_lines = calculate_tool_round_limit(files)
 
     return f"""
 You are an expert software engineer performing a GitHub Pull Request code review.
@@ -205,12 +308,16 @@ You cannot run shell commands. You may only use these tools:
 - fetch_repo
 - search_code
 - read_file
+- inspect_repo (batch several searches and file reads in one call)
 
 Workflow:
 1. Call fetch_repo so the PR head commit is available locally.
-2. From the changed methods/classes, call search_code to find callers in other files.
-3. Call read_file on relevant callers if you need more context.
-4. Then return the final JSON review.
+2. Identify the changed symbols that could affect callers or behavior.
+3. Batch independent searches and relevant file reads into one inspect_repo call. Use focused searches and read only files needed to confirm likely issues.
+4. If the results reveal a new lead, batch the next group of searches/reads together. Do not repeat searches already answered.
+5. Return the final JSON review as soon as there is enough evidence; use the full budget only when needed.
+
+The current budget is {tool_round_limit} model/tool-response rounds for {changed_lines} changed lines (maximum budget: {MAX_TOOL_ROUNDS}). The limit counts model/tool-response cycles, not individual operations inside inspect_repo. Each inspect_repo call can contain up to 12 searches and 12 file reads.
 
 Focus only on meaningful issues involving:
 - Bugs and incorrect behavior
@@ -360,9 +467,15 @@ async def review_files(
         tools=tools,
     )
 
+    tool_round_limit, changed_lines = calculate_tool_round_limit(files)
+    print(
+        f"Gemini tool budget: {tool_round_limit} rounds "
+        f"for {changed_lines} changed lines"
+    )
+
     review_text = ""
 
-    for round_number in range(MAX_TOOL_ROUNDS):
+    for round_number in range(tool_round_limit):
         response = client.models.generate_content(
             model=REVIEW_MODEL,
             contents=contents,
@@ -418,7 +531,8 @@ async def review_files(
         )
     else:
         raise ValueError(
-            "Gemini used too many tool calls "
+            f"Gemini used too many tool rounds "
+            f"(limit: {tool_round_limit}) "
             "without returning a review."
         )
 
