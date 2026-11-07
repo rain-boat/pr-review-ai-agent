@@ -446,6 +446,7 @@ async def complete_ai_review_check(
     repo: str,
     check_run_id: int,
     issues_count: int,
+    analysis_markdown: str = "",
 ) -> dict:
     """
     Mark the AI review Check Run as completed.
@@ -479,7 +480,8 @@ async def complete_ai_review_check(
             "title": "AI review completed",
             "summary": (
                 f"🤖 AI review completed. "
-                f"Found {issues_count} issue(s)."
+                f"Found {issues_count} issue(s).\n\n"
+                f"{analysis_markdown}"
             ),
         },
     }
@@ -520,6 +522,7 @@ async def create_pull_request_review(
     pull_number: int,
     commit_id: str,
     issues: list[dict],
+    analysis_markdown: str = "",
 ) -> dict:
     access_token = (
         await get_installation_access_token(
@@ -546,7 +549,8 @@ async def create_pull_request_review(
             "## 🤖 AI Code Review\n\n"
             f"Found **{len(issues)} issue(s)**. "
             "Inline comments are attached to "
-            "the relevant changed lines."
+            "the relevant changed lines.\n\n"
+            f"{analysis_markdown}"
         ),
         "event": "COMMENT",
         "comments": comments,

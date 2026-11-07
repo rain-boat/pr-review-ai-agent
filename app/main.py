@@ -432,6 +432,7 @@ from app.github import (
     get_pull_request_files,
 )
 from app.reviewer import review_files
+from app.pr_impact_analysis import analyze_pull_request, render_analysis
 from app.review_state import (
     filter_new_issues,
     mark_missing_issues_inactive,
@@ -470,6 +471,7 @@ async def review_pull_request(
     pull_number: int,
     commit_id: str,
     clone_url: str,
+    pr_metadata: dict,
 ):
     print("=" * 60)
     print(
@@ -535,6 +537,14 @@ async def review_pull_request(
             pull_number=pull_number,
         )
 
+        # PR-wide analysis is independent of the existing inline review.
+        analysis = await analyze_pull_request(
+            pr_metadata=pr_metadata,
+            files=files,
+            review=review,
+        )
+        analysis_markdown = render_analysis(analysis)
+
         issues = review.get(
             "issues",
             []
@@ -564,31 +574,6 @@ async def review_pull_request(
             pull_number=pull_number,
             current_issues=issues,
         )
-
-        # --------------------------------------------------
-        # 5. No issues found
-        # --------------------------------------------------
-
-        if not issues:
-            await complete_ai_review_check(
-                installation_id=installation_id,
-                owner=owner,
-                repo=repo,
-                check_run_id=check_run_id,
-                issues_count=0,
-            )
-
-            print(
-                f"No issues found for PR "
-                f"#{pull_number}"
-            )
-
-            return {
-                "status": "completed",
-                "issues": 0,
-                "new_issues": 0,
-                "inline_comments": 0,
-            }
 
         # --------------------------------------------------
         # 6. Validate Gemini issues
@@ -633,12 +618,22 @@ async def review_pull_request(
         # --------------------------------------------------
 
         if not valid_issues:
+            await create_pull_request_review(
+                installation_id=installation_id,
+                owner=owner,
+                repo=repo,
+                pull_number=pull_number,
+                commit_id=commit_id,
+                issues=[],
+                analysis_markdown=analysis_markdown,
+            )
             await complete_ai_review_check(
                 installation_id=installation_id,
                 owner=owner,
                 repo=repo,
                 check_run_id=check_run_id,
                 issues_count=len(issues),
+                analysis_markdown=analysis_markdown,
             )
 
             print(
@@ -651,6 +646,8 @@ async def review_pull_request(
                 "issues": len(issues),
                 "new_issues": 0,
                 "inline_comments": 0,
+                "pr_impact_analysis": analysis.model_dump(),
+                "pr_impact_analysis_markdown": analysis_markdown,
             }
 
         # --------------------------------------------------
@@ -702,20 +699,19 @@ async def review_pull_request(
         # 10. Create GitHub comments ONLY for NEW issues
         # --------------------------------------------------
 
-        github_review = None
+        github_review = (
+            await create_pull_request_review(
+                installation_id=installation_id,
+                owner=owner,
+                repo=repo,
+                pull_number=pull_number,
+                commit_id=commit_id,
+                issues=new_issues,
+                analysis_markdown=analysis_markdown,
+            )
+        )
 
         if new_issues:
-            github_review = (
-                await create_pull_request_review(
-                    installation_id=installation_id,
-                    owner=owner,
-                    repo=repo,
-                    pull_number=pull_number,
-                    commit_id=commit_id,
-                    issues=new_issues,
-                )
-            )
-
             print("=" * 60)
             print(
                 f"GitHub review created for "
@@ -735,13 +731,7 @@ async def review_pull_request(
             print("=" * 60)
 
         else:
-            print(
-                "No new issues."
-            )
-
-            print(
-                "Skipping GitHub review comment."
-            )
+            print("No new inline issues; published PR impact analysis.")
 
         # --------------------------------------------------
         # 11. Mark Check Run as completed
@@ -753,6 +743,7 @@ async def review_pull_request(
             repo=repo,
             check_run_id=check_run_id,
             issues_count=len(valid_issues),
+            analysis_markdown=analysis_markdown,
         )
 
         print(
@@ -766,6 +757,8 @@ async def review_pull_request(
             "new_issues": len(new_issues),
             "existing_issues": existing_issue_count,
             "inline_comments": len(new_issues),
+            "pr_impact_analysis": analysis.model_dump(),
+            "pr_impact_analysis_markdown": analysis_markdown,
             "review_url": (
                 github_review.get(
                     "html_url"
@@ -997,6 +990,16 @@ async def github_webhook(
             pull_number=pull_number,
             commit_id=commit_id,
             clone_url=clone_url,
+            pr_metadata={
+                "number": pull_number,
+                "title": pull_request.get("title", ""),
+                "description": pull_request.get("body", "") or "",
+                "base_branch": (pull_request.get("base") or {}).get("ref"),
+                "head_branch": (pull_request.get("head") or {}).get("ref"),
+                "head_sha": commit_id,
+                "commit_messages": None,
+                "commit_messages_note": "Not supplied by the existing webhook workflow; no extra API request is made.",
+            },
         )
 
         return {
